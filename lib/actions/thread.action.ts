@@ -6,22 +6,28 @@ import { revalidatePath } from "next/cache";
 import { connectToDB } from "../mongoose";
 import Thread from "../models/thread.model";
 import User from "../models/user.model";
+import Community from "../models/community.model";
 
-interface Params{
+interface Params {
     text: string;
     author: string;
     communityId: string | null;
     path: string;
 };
 
-export async function createThread({ text, author, communityId, path }: Params){
+export async function createThread({ text, author, communityId, path }: Params) {
     try {
         connectToDB();
+
+        const communityIdObject = await Community.findOne(
+            { id: communityId },
+            { _id: 1 }
+        );
 
         const createdThread = await Thread.create({
             text,
             author,
-            community: null,
+            community: communityIdObject, // Assign communityId if provided, or leave it null for personal account
         });
 
         // update User model
@@ -29,14 +35,21 @@ export async function createThread({ text, author, communityId, path }: Params){
             $push: { threads: createdThread._id },
         });
 
+        if (communityIdObject) {
+            // Update Community model
+            await Community.findByIdAndUpdate(communityIdObject, {
+                $push: { threads: createdThread._id },
+            });
+        };
+
         revalidatePath(path);
 
-    }catch(error: any) {
+    } catch (error: any) {
         throw new Error(`Error creating thread: ${error.message}`);
     };
 };
 
-export async function fetchPosts(pageNumber = 1, pageSize = 20){
+export async function fetchPosts(pageNumber = 1, pageSize = 20) {
     connectToDB();
 
     // skipAmount 計算了需要跳過多少個文檔，這樣您就可以根據所需的分頁查詢來設定適當的跳過量。
@@ -46,22 +59,25 @@ export async function fetchPosts(pageNumber = 1, pageSize = 20){
     const skipAmount = (pageNumber - 1) * pageSize;
 
     // fetch the posts that have no parents (top-level threads...)
-    const postsQuery =  Thread.find({
+    const postsQuery = Thread.find({
         // 查找 parentId 值為 null 或 undefined 的帖子。
         // $in: [null, undefined]：這是使用 $in 運算符來指定一個陣列，陣列中的值可以是 null 或 undefined。這將匹配具有這些值的帖子。
-        parentId: { $in: [null,undefined] }
+        parentId: { $in: [null, undefined] }
     }).sort({ createdAt: 'desc' })
-    .skip(skipAmount)
-    .limit(pageSize)
-    .populate({ path: 'author', model: User }) // path 要填充的參考屬性, model 指定要填充的模型名稱。
-    .populate({ path: 'children', populate: {
-        path: 'author',
-        model: User,
-        select: '_id name parentId image' // 指定需要選擇的字段。
-    } });
+        .skip(skipAmount)
+        .limit(pageSize)
+        .populate({ path: 'author', model: User }) // path 要填充的參考屬性, model 指定要填充的模型名稱。
+        .populate({ path: 'community', model: Community })
+        .populate({
+            path: 'children', populate: {
+                path: 'author',
+                model: User,
+                select: '_id name parentId image' // 指定需要選擇的字段。
+            }
+        });
 
     const totalPostsCount = await Thread.countDocuments({
-        parentId: { $in: [null,undefined] }
+        parentId: { $in: [null, undefined] }
     });
 
     // exec() 函數被用於執行 postsQuery，即查詢符合條件的帖子。
@@ -78,52 +94,55 @@ export async function fetchPosts(pageNumber = 1, pageSize = 20){
     return { posts, isNext };
 };
 
-export async function fetchThreadById(threadId: string){
+export async function fetchThreadById(threadId: string) {
     connectToDB();
 
     try {
-        // TODO: Populate Community
-
         const thread = await Thread.findById(threadId)
-        .populate({
-            path: 'author',
-            model: User,
-            select: '_id id name image'
-        })
-        .populate({
-            path: 'children',
-            populate: [
-                {
-                    path: 'author',
-                    model: User,
-                    select: '_id id name parentId image',
-                },
-                {
-                    path: 'children',
-                    model: Thread,
-                    populate: {
+            .populate({
+                path: 'author',
+                model: User,
+                select: '_id id name image'
+            })
+            .populate({
+                path: 'community',
+                model: Community,
+                select: '_id id name image',
+            })
+            .populate({
+                path: 'children',
+                populate: [
+                    {
                         path: 'author',
                         model: User,
                         select: '_id id name parentId image',
+                    },
+                    {
+                        path: 'children',
+                        model: Thread,
+                        populate: {
+                            path: 'author',
+                            model: User,
+                            select: '_id id name parentId image',
+                        }
                     }
-                }
-            ],
-        }).exec();
+                ],
+            }).exec();
 
         return thread;
 
-    }catch(error: any) {
+    } catch (error: any) {
         throw new Error(`Error fetching thread: ${error.message}`);
     };
 };
 
-export async function addCommentToThread(threadId: string, commentText: string, userId: string, path: string){
+export async function addCommentToThread(threadId: string, commentText: string, userId: string, path: string) {
     connectToDB();
 
     try {
         // Find the original thread by its ID
         const originalThread = await Thread.findById(threadId);
-        if(!originalThread) throw new Error('Thread not found');
+        if (!originalThread) throw new Error('Thread not found');
 
         // Create a new thread with the comment text
         const commentThread = new Thread({
@@ -143,37 +162,113 @@ export async function addCommentToThread(threadId: string, commentText: string, 
 
         revalidatePath(path);
 
-    }catch(error: any) {
+    } catch (error: any) {
         console.log('Error while adding comment', error);
         throw new Error('Unable to add comment');
     };
 };
 
-export async function fetchUserPosts(userId: string){
+async function fetchAllChildThreads(threadId: string): Promise<any[]> {
+    const childThreads = await Thread.find({ parentId: threadId });
+
+    const descendantThreads = [];
+
+    for (const childThread of childThreads) {
+
+        const descendants = await fetchAllChildThreads(childThread._id);
+
+        descendantThreads.push(childThread, ...descendants);
+    };
+
+    return descendantThreads;
+};
+
+export async function deleteThread(id: string, path: string): Promise<void> {
+    try {
+        connectToDB();
+
+        // Find the thread to be deleted (the main thread)
+        const mainThread = await Thread.findById(id).populate("author community");
+
+        if (!mainThread) {
+            throw new Error("Thread not found");
+        }
+
+        // Fetch all child threads and their descendants recursively
+        const descendantThreads = await fetchAllChildThreads(id);
+
+        // Get all descendant thread IDs including the main thread ID and child thread IDs
+        const descendantThreadIds = [
+            id,
+            ...descendantThreads.map((thread) => thread._id),
+        ];
+
+        // Extract the authorIds and communityIds to update User and Community models respectively
+        const uniqueAuthorIds = new Set(
+            [
+                ...descendantThreads.map((thread) => thread.author?._id?.toString()), // Use optional chaining to handle possible undefined values
+                mainThread.author?._id?.toString(),
+            ].filter((id) => id !== undefined)
+        );
+
+        const uniqueCommunityIds = new Set(
+            [
+                ...descendantThreads.map((thread) => thread.community?._id?.toString()), // Use optional chaining to handle possible undefined values
+                mainThread.community?._id?.toString(),
+            ].filter((id) => id !== undefined)
+        );
+
+        // Recursively delete child threads and their descendants
+        await Thread.deleteMany({ _id: { $in: descendantThreadIds } });
+
+        // Update User model
+        await User.updateMany(
+            { _id: { $in: Array.from(uniqueAuthorIds) } },
+            { $pull: { threads: { $in: descendantThreadIds } } }
+        );
+
+        // Update Community model
+        await Community.updateMany(
+            { _id: { $in: Array.from(uniqueCommunityIds) } },
+            { $pull: { threads: { $in: descendantThreadIds } } }
+        );
+
+        revalidatePath(path);
+    } catch (error: any) {
+        throw new Error(`Failed to delete thread: ${error.message}`);
+    }
+}
+
+export async function fetchUserPosts(userId: string) {
     try {
         connectToDB();
 
         // Find all threads authored by user with the given userId
-
-        // TODO: Populate community
         const threads = await User.findOne({ id: userId })
-        .populate({
-            path: 'threads',
-            model: Thread,
-            populate: {
-                path: 'children',
+            .populate({
+                path: 'threads',
                 model: Thread,
-                populate: {
-                    path: 'author',
-                    model: User,
-                    select: 'name image id',
-                },
-            },
-        });
+                populate: [
+                    {
+                        path: 'community',
+                        model: Community,
+                        select: 'name id image _id' // Select the "name" and "_id" fields from the "Community" model
+                    },
+                    {
+                        path: 'children',
+                        model: Thread,
+                        populate: {
+                            path: 'author',
+                            model: User,
+                            select: 'name image id' // Select the "name" and "_id" fields from the "User" model
+                        },
+                    },
+                ],
+            });
 
         return threads;
 
-    }catch(error: any) {
+    } catch (error: any) {
         throw new Error(`Failed to fetch user posts: ${error.message}`);
     };
 };
